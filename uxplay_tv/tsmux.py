@@ -165,6 +165,8 @@ class H264Depacketizer:
         return self._build(nals, ts)
 
     def _build(self, nals, ts):
+        # SPS'e "yeniden sıralama yok" bildirimi ekle (sabit ekranda görüntü gecikmesin)
+        nals = [add_bitstream_restriction(n) if n and n[0] & 0x1F == 7 else n for n in nals]
         types = [n[0] & 0x1F for n in nals if n]
         for n in nals:
             if n and n[0] & 0x1F == 7:
@@ -181,3 +183,166 @@ class H264Depacketizer:
             if n and n[0] & 0x1F != 9:
                 out += SC + n
         return bytes(out), ts, key
+
+
+# ---------------------------------------------------------------------------
+# SPS yeniden yazma: "yeniden sıralama yok" bildirimi ekle
+#
+# iPhone'un SPS'inde bitstream_restriction yok. Böyle akışlarda çözücüler seviyenin izin
+# verdiği en kötü durumu (burada 8 kare) varsayıp çıktıyı geciktirir; ekran sabitken (saniyede
+# birkaç kare) görüntü bir türlü gelmez. num_reorder_frames=0 ile çözücü kareyi hemen gösterir.
+# ---------------------------------------------------------------------------
+
+def _unescape(b):
+    out, zeros = bytearray(), 0
+    for x in b:
+        if zeros >= 2 and x == 3:
+            zeros = 0
+            continue
+        out.append(x)
+        zeros = zeros + 1 if x == 0 else 0
+    return bytes(out)
+
+
+def _escape(b):
+    out, zeros = bytearray(), 0
+    for x in b:
+        if zeros >= 2 and x <= 3:
+            out.append(3)
+            zeros = 0
+        out.append(x)
+        zeros = zeros + 1 if x == 0 else 0
+    return bytes(out)
+
+
+class _BitReader:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def bit(self):
+        v = (self.data[self.pos >> 3] >> (7 - (self.pos & 7))) & 1
+        self.pos += 1
+        return v
+
+    def bits(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.bit()
+        return v
+
+    def ue(self):
+        zeros = 0
+        while self.bit() == 0:
+            zeros += 1
+        return (1 << zeros) - 1 + (self.bits(zeros) if zeros else 0)
+
+    def se(self):
+        k = self.ue()
+        return (k + 1) // 2 if k & 1 else -(k // 2)
+
+
+def _write_ue(out, value):
+    value += 1
+    n = value.bit_length()
+    out.extend([0] * (n - 1))
+    out.extend((value >> i) & 1 for i in range(n - 1, -1, -1))
+
+
+def _skip_hrd(r):
+    n = r.ue()
+    r.bits(8)
+    for _ in range(n + 1):
+        r.ue()
+        r.ue()
+        r.bit()
+    r.bits(20)
+
+
+def add_bitstream_restriction(sps):
+    """SPS NAL'ine (başlık baytı dahil) num_reorder_frames=0 olan bitstream_restriction ekler.
+
+    Çözümleyemezse veya zaten ayarlıysa özgün SPS'i döndürür."""
+    try:
+        rbsp = _unescape(sps[1:])
+        r = _BitReader(rbsp)
+        profile = r.bits(8)
+        r.bits(16)
+        r.ue()  # sps_id
+        if profile in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+            chroma = r.ue()
+            if chroma == 3:
+                r.bit()
+            r.ue()
+            r.ue()
+            r.bit()
+            if r.bit():  # ölçekleme matrisleri
+                for i in range(8 if chroma != 3 else 12):
+                    if r.bit():
+                        last = nxt = 8
+                        for _ in range(16 if i < 6 else 64):
+                            if nxt != 0:
+                                nxt = (last + r.se() + 256) % 256
+                            last = last if nxt == 0 else nxt
+        r.ue()  # log2_max_frame_num
+        poc = r.ue()
+        if poc == 0:
+            r.ue()
+        elif poc == 1:
+            r.bit()
+            r.se()
+            r.se()
+            for _ in range(r.ue()):
+                r.se()
+        refs = r.ue()
+        r.bit()
+        r.ue()
+        r.ue()
+        if not r.bit():  # frame_mbs_only_flag
+            r.bit()
+        r.bit()
+        if r.bit():  # kırpma
+            for _ in range(4):
+                r.ue()
+        vui_flag_pos = r.pos
+        has_vui = r.bit()
+        cut = vui_flag_pos  # buraya kadar aynen kopyalanır
+        if has_vui:
+            if r.bit() and r.bits(8) == 255:
+                r.bits(32)
+            if r.bit():
+                r.bit()
+            if r.bit():
+                r.bits(4)
+                if r.bit():
+                    r.bits(24)
+            if r.bit():
+                r.ue()
+                r.ue()
+            if r.bit():
+                r.bits(64)
+                r.bit()
+            hrd = 0
+            for _ in range(2):
+                if r.bit():
+                    hrd = 1
+                    _skip_hrd(r)
+            if hrd:
+                r.bit()
+            r.bit()  # pic_struct_present_flag
+            cut = r.pos  # bitstream_restriction_flag burada
+            if r.bit():
+                return sps  # zaten var
+        bits = [(rbsp[i >> 3] >> (7 - (i & 7))) & 1 for i in range(cut)]
+        if not has_vui:
+            bits.append(1)  # vui_parameters_present_flag
+            bits.extend([0] * 8)  # aspect, overscan, video_signal, chroma_loc, timing, nal_hrd, vcl_hrd, pic_struct
+        bits.append(1)  # bitstream_restriction_flag
+        bits.append(1)  # motion_vectors_over_pic_boundaries_flag
+        for v in (0, 0, 15, 15, 0, max(refs, 1)):
+            _write_ue(bits, v)  # denomlar, mv uzunlukları, num_reorder_frames=0, max_dec_frame_buffering
+        bits.append(1)  # rbsp_stop_one_bit
+        bits.extend([0] * (-len(bits) % 8))
+        data = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+        return sps[:1] + _escape(data)
+    except (IndexError, ValueError):
+        return sps
