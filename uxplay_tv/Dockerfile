@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && install -m 0755 /tmp/uxplay/build/uxplay /usr/local/bin/uxplay \
     && rm -rf /tmp/uxplay /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends dbus \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY run.sh streamer.py /opt/uxplay-tv/
 RUN chmod +x /opt/uxplay-tv/run.sh
 

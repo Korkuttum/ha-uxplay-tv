@@ -18,20 +18,50 @@ m=audio 5002 RTP/AVP 97
 a=rtpmap:97 L16/44100/2
 SDP
 
-# Kendi mDNS (Avahi) servisimiz: HA OS'in avahi'sine erişimimiz yok.
-mkdir -p /run/avahi-daemon /etc/avahi
-cat > /etc/avahi/avahi-daemon.conf <<AVAHI
+# mDNS: UxPlay, Avahi'ye D-Bus üzerinden bağlanır (avahi-client).
+# 1) HA OS'in kendi Avahi'si (host_dbus), 2) olmazsa konteyner içinde dbus + avahi.
+avahi_ok() {
+  dbus-send --system --print-reply --dest=org.freedesktop.Avahi / \
+    org.freedesktop.Avahi.Server.GetVersionString >/dev/null 2>&1
+}
+
+if avahi_ok; then
+  echo "[run] Ana makinenin Avahi servisi kullanılıyor (host_dbus)"
+else
+  echo "[run] Ana makinede Avahi bulunamadı, konteyner içinde başlatılıyor"
+  mkdir -p /run/avahi-daemon /etc/avahi
+  cat > /tmp/own-bus.conf <<BUS
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path=/tmp/uxplay-bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow user="*"/>
+    <allow own="*"/>
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+  </policy>
+</busconfig>
+BUS
+  rm -f /tmp/uxplay-bus
+  dbus-daemon --config-file=/tmp/own-bus.conf --fork
+  export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/tmp/uxplay-bus
+  cat > /etc/avahi/avahi-daemon.conf <<AVAHI
 [server]
 host-name=uxplay-tv
 use-ipv4=yes
 use-ipv6=no
-enable-dbus=no
+enable-dbus=yes
 [publish]
 publish-hinfo=no
 publish-workstation=no
 [rlimits]
 AVAHI
-avahi-daemon --no-drop-root --no-chroot --no-rlimits -D
-for _ in $(seq 1 20); do [ -S /run/avahi-daemon/socket ] && break; sleep 0.5; done
+  avahi-daemon --no-drop-root --no-chroot --no-rlimits -D || echo "[run] avahi-daemon başlatılamadı"
+  for _ in $(seq 1 20); do avahi_ok && break; sleep 0.5; done
+  avahi_ok && echo "[run] Konteyner içi Avahi hazır" || echo "[run] UYARI: Avahi'ye ulaşılamıyor, AirPlay cihazı görünmeyebilir"
+fi
 
 exec python3 /opt/uxplay-tv/streamer.py

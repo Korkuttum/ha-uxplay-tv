@@ -289,9 +289,15 @@ def uxplay_manager():
             restart_evt.clear()
             continue
         state["uxplay"] = True
+        started_at = time.time()
         while proc.poll() is None and not restart_evt.wait(1):
             pass
-        restart_evt.clear()
+        if restart_evt.is_set():
+            restart_evt.clear()
+        elif time.time() - started_at < 10:
+            log("UxPlay hemen kapandı (mDNS/Avahi sorunu olabilir), 30 sn sonra yeniden denenecek")
+            restart_evt.wait(30)
+            restart_evt.clear()
         if proc.poll() is None:
             proc.terminate()
             try:
