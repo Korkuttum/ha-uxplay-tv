@@ -14,8 +14,6 @@ c=IN IP4 127.0.0.1
 t=0 0
 m=video 5000 RTP/AVP 96
 a=rtpmap:96 H264/90000
-m=audio 5002 RTP/AVP 97
-a=rtpmap:97 L16/44100/2
 SDP
 
 # mDNS: UxPlay, Avahi'ye D-Bus üzerinden bağlanır (avahi-client).

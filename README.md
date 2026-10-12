@@ -31,7 +31,7 @@ Yayın yokken `http://<pi-ip>:8090/health` JSON durumunu verir. `http://<pi-ip>:
 
 - Gecikme TV tamponuna bağlı olarak 2–6 sn. Oyun için uygun değil.
 - DRM'li içerik (Netflix vb.) yansımaz.
-- iPhone ekranı sabitken video karesi gönderilmez; `idle_timeout` bu yüzden varsayılan 20 sn. Çok kısa yaparsanız durağan ekran yayını kapanabilir.
+- iPhone ekranı sabitken video karesi gönderilmez; yayını bitmiş saymak için bekleme süresi bu yüzden varsayılan 30 sn. Çok kısa yaparsanız durağan ekran yayını kapanabilir.
 - Add-on kendi Avahi (mDNS) servisini çalıştırır; ağınızda mDNS engelli ise iPhone cihazı göremez.
 - Yayın TV'ye ortadan bağlandığı için ilk saniyede görüntü bir sonraki anahtar kareye kadar bozuk/boş olabilir.
 

@@ -4,6 +4,7 @@
 Bir iPhone yayını başlayınca (ilk TS verisi gelince) HA'daki TV'ye play_media gönderir,
 yayın bitince (idle_timeout kadar veri gelmezse) TV'yi durdurur.
 """
+import array
 import json
 import os
 import queue
@@ -23,10 +24,13 @@ HA_API = os.environ.get("HA_API", "http://supervisor/core/api/")
 STREAM_PORT = 8090
 UI_PORT = int(os.environ.get("UI_PORT") or 8099)
 AUDIO_BITRATE = "128k"
-IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT") or 20)
+IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT") or 30)
 DEBUG = os.environ.get("DEBUG", "false") == "true"
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 UXPLAY = os.environ.get("UXPLAY", "uxplay")
+VIDEO_IN_PORT = 5010   # UxPlay -> Python
+VIDEO_OUT_PORT = 5000  # Python -> ffmpeg (SDP; RTCP için 5001 ffmpeg tarafından ayrılır)
+AUDIO_IN_PORT = 5020   # UxPlay -> Python (RTP L16)
 RESOLUTION = "1920x1080"
 FPS = "30"
 DEFAULTS = {"tv_entity": "", "airplay_name": "", "media_content_type": "video/mpeg"}
@@ -142,18 +146,74 @@ def on_end():
             ha_call("POST", "services/media_player/media_stop", {"entity_id": cfg["tv_entity"]})
 
 
+audio_lock = threading.Lock()
+audio_buf = bytearray()
+last_video = [0.0]
+BYTES_PER_SEC = 44100 * 4
+
+
+def rtp_relay():
+    """Video RTP'yi ffmpeg'e iletir (son paket zamanını tutar); ses RTP'sini PCM tampona alır."""
+    vs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    vs.bind(("127.0.0.1", VIDEO_IN_PORT))
+    au = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    au.bind(("127.0.0.1", AUDIO_IN_PORT))
+    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    while True:
+        ready, _, _ = select.select([vs, au], [], [], 1.0)
+        for sock in ready:
+            data = sock.recv(65535)
+            if sock is vs:
+                last_video[0] = time.time()
+                out.sendto(data, ("127.0.0.1", VIDEO_OUT_PORT))
+            elif len(data) > 12:
+                payload = data[12 + 4 * (data[0] & 0x0F):]
+                pcm = array.array("h")
+                pcm.frombytes(payload[: len(payload) // 4 * 4])
+                pcm.byteswap()  # L16 ağ sırası (BE) -> s16le
+                with audio_lock:
+                    audio_buf.extend(pcm.tobytes())
+                    extra = len(audio_buf) - int(BYTES_PER_SEC * 0.4)
+                    if extra > 0:
+                        del audio_buf[: extra // 4 * 4]
+
+
+def audio_feeder(stdin, stop):
+    """ffmpeg'e gerçek zamanlı PCM verir: ses varsa onu, yoksa sessizlik."""
+    chunk = BYTES_PER_SEC // 50  # 20 ms
+    with audio_lock:
+        audio_buf.clear()
+    nxt = time.monotonic()
+    try:
+        while not stop.is_set():
+            with audio_lock:
+                n = min(len(audio_buf), chunk) // 4 * 4
+                data = bytes(audio_buf[:n])
+                del audio_buf[:n]
+            stdin.write(data + bytes(chunk - n))
+            stdin.flush()
+            nxt += 0.02
+            delay = nxt - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.5:
+                nxt = time.monotonic()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
 def ffmpeg_cmd():
     return [
         FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "fatal",
         "-protocol_whitelist", "file,udp,rtp",
         "-fflags", "+nobuffer+genpts", "-flags", "low_delay",
         "-analyzeduration", "1000000", "-probesize", "500000",
-        "-use_wallclock_as_timestamps", "1",
         "-i", SDP_FILE,
-        "-map", "0:v:0", "-map", "0:a:0?",
+        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+        "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
         "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100",
-        "-af", "aresample=async=1000",
+        "-af", "aresample=async=1:first_pts=0",
         "-max_interleave_delta", "300000",
         "-f", "mpegts", "-mpegts_flags", "+resend_headers",
         "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1",
@@ -162,10 +222,12 @@ def ffmpeg_cmd():
 
 
 def session():
-    p = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.PIPE, bufsize=0)
+    p = subprocess.Popen(ffmpeg_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    stop = threading.Event()
+    threading.Thread(target=audio_feeder, args=(p.stdin, stop), daemon=True).start()
     fd = p.stdout.fileno()
+    last_video[0] = 0.0
     started = False
-    last = time.time()
     try:
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
@@ -175,15 +237,16 @@ def session():
                     break
                 if not started:
                     started = True
+                    last_video[0] = last_video[0] or time.time()
                     on_start()
-                last = time.time()
                 broadcast(data)
             elif p.poll() is not None:
                 break
-            elif started and time.time() - last > IDLE_TIMEOUT:
-                log(f"{IDLE_TIMEOUT:.0f} sn veri gelmedi, oturum kapatılıyor")
+            if started and time.time() - last_video[0] > IDLE_TIMEOUT:
+                log(f"{IDLE_TIMEOUT:.0f} sn görüntü gelmedi, oturum kapatılıyor")
                 break
     finally:
+        stop.set()
         p.kill()
         p.wait()
         close_clients()
@@ -276,8 +339,8 @@ def uxplay_manager():
             continue
         name = cfg["airplay_name"] or friendly_name(cfg["tv_entity"])
         args = [UXPLAY, "-n", name, "-nh", "-p", "-s", RESOLUTION, "-fps", FPS, "-nohold",
-                "-vrtp", "pt=96 config-interval=1 ! udpsink host=127.0.0.1 port=5000",
-                "-artp", "pt=97 ! udpsink host=127.0.0.1 port=5002"]
+                "-vrtp", f"pt=96 config-interval=1 ! udpsink host=127.0.0.1 port={VIDEO_IN_PORT}",
+                "-artp", f"pt=97 ! udpsink host=127.0.0.1 port={AUDIO_IN_PORT}"]
         if DEBUG:
             args.append("-d")
         log("UxPlay başlatılıyor, AirPlay adı:", name)
@@ -450,6 +513,7 @@ load().catch(e=>{$("ent").innerHTML='<option value="">Liste yüklenemedi: '+e.me
 
 def main():
     log("Akış adresi:", STREAM_URL)
+    threading.Thread(target=rtp_relay, daemon=True).start()
     threading.Thread(target=ffmpeg_loop, daemon=True).start()
     threading.Thread(target=uxplay_manager, daemon=True).start()
     threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", UI_PORT), UIHandler).serve_forever, daemon=True).start()
