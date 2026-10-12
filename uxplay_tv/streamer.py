@@ -5,6 +5,7 @@ Bir iPhone yayını başlayınca (ilk TS verisi gelince) HA'daki TV'ye play_medi
 yayın bitince (idle_timeout kadar veri gelmezse) TV'yi durdurur.
 """
 import array
+import collections
 import json
 import os
 import queue
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -35,8 +37,13 @@ RESOLUTION = "1920x1080"
 FPS = "30"
 DEFAULTS = {"tv_entity": "", "airplay_name": "", "media_content_type": "video/mpeg"}
 
+events = collections.deque(maxlen=40)
+
+
 def log(*a):
-    print("[streamer]", *a, file=sys.stderr, flush=True)
+    msg = " ".join(str(x) for x in a)
+    events.append(time.strftime("%H:%M:%S ") + msg)
+    print("[streamer]", msg, file=sys.stderr, flush=True)
 
 
 def local_ip():
@@ -117,7 +124,12 @@ def ha_call(method, path, payload=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read()
+            if method == "POST":
+                log(f"HA çağrısı tamam: {path} (HTTP {r.status})")
             return json.loads(body) if body else None
+    except urllib.error.HTTPError as e:
+        log(f"HA çağrısı başarısız: {path} -> HTTP {e.code} {e.read()[:200].decode(errors='replace')}")
+        return None
     except Exception as e:  # noqa: BLE001
         log("HA çağrısı başarısız:", path, e)
         return None
@@ -289,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         q = queue.Queue(maxsize=256)
         with clients_lock:
             clients.add(q)
-        log("İstemci bağlandı:", self.address_string())
+        log("İstemci bağlandı:", self.address_string(), "|", (self.headers.get("User-Agent") or "-")[:60])
         try:
             while True:
                 try:
@@ -398,6 +410,8 @@ class UIHandler(BaseHTTPRequestHandler):
         elif path.endswith("/api/entities"):
             players = media_players()
             self._json({"ok": players is not None, "entities": players or []})
+        elif path.endswith("/api/logs"):
+            self._json({"events": list(events)})
         elif path.endswith("/api/state"):
             self._json({**get_settings(), "live": state["live"], "uxplay": state["uxplay"],
                         "stream_url": STREAM_URL})
@@ -467,6 +481,10 @@ details{margin-top:16px}summary{cursor:pointer;color:var(--mut)}code{word-break:
 <div class="row"><span id="d2" class="dot"></span><span id="t2">Yayın yok</span></div>
 <p style="margin-top:10px">Akış adresi: <code id="url"></code></p>
 </div>
+<div class="card">
+<strong>Son olaylar</strong>
+<pre id="ev" style="white-space:pre-wrap;font-size:.8rem;color:var(--mut);margin:8px 0 0">—</pre>
+</div>
 </main>
 <script>
 const $=id=>document.getElementById(id);let dirty=false,names={};
@@ -506,8 +524,9 @@ $("save").onclick=async()=>{
   }catch(x){m.className="msg err";m.textContent=x.message}
   b.disabled=false;
 };
-async function poll(){try{refresh(await api("state").then(r=>r.json()))}catch(e){}}
-load().catch(e=>{$("ent").innerHTML='<option value="">Liste yüklenemedi: '+e.message+"</option>"});setInterval(poll,5000);
+async function poll(){try{refresh(await api("state").then(r=>r.json()));
+  const l=await api("logs").then(r=>r.json());$("ev").textContent=l.events.length?l.events.slice(-15).join("\n"):"—"}catch(e){}}
+load().then(poll).catch(e=>{$("ent").innerHTML='<option value="">Liste yüklenemedi: '+e.message+"</option>"});setInterval(poll,5000);
 </script></body></html>"""
 
 
