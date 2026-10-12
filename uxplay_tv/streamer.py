@@ -162,6 +162,12 @@ audio_lock = threading.Lock()
 audio_buf = bytearray()
 last_video = [0.0]
 BYTES_PER_SEC = 44100 * 4
+session_lock = threading.Lock()
+sess = {"active": False}
+backlog = collections.deque(maxlen=1500)  # oturum açılırken gelen video RTP paketleri
+first_video = threading.Event()
+teardown_evt = threading.Event()
+out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
 def rtp_relay():
@@ -170,14 +176,18 @@ def rtp_relay():
     vs.bind(("127.0.0.1", VIDEO_IN_PORT))
     au = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     au.bind(("127.0.0.1", AUDIO_IN_PORT))
-    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while True:
         ready, _, _ = select.select([vs, au], [], [], 1.0)
         for sock in ready:
             data = sock.recv(65535)
             if sock is vs:
                 last_video[0] = time.time()
-                out.sendto(data, ("127.0.0.1", VIDEO_OUT_PORT))
+                with session_lock:
+                    if sess["active"]:
+                        out_sock.sendto(data, ("127.0.0.1", VIDEO_OUT_PORT))
+                    else:
+                        backlog.append(data)
+                        first_video.set()
             elif len(data) > 12:
                 payload = data[12 + 4 * (data[0] & 0x0F):]
                 pcm = array.array("h")
@@ -221,7 +231,7 @@ def ffmpeg_cmd():
         "-fflags", "+nobuffer+genpts", "-flags", "low_delay",
         "-analyzeduration", "1000000", "-probesize", "500000",
         "-i", SDP_FILE,
-        "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+        "-thread_queue_size", "512", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
         "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100",
@@ -238,9 +248,18 @@ def session():
     stop = threading.Event()
     threading.Thread(target=audio_feeder, args=(p.stdin, stop), daemon=True).start()
     fd = p.stdout.fileno()
-    last_video[0] = 0.0
+    teardown_evt.clear()
     started = False
     try:
+        time.sleep(1.2)  # ffmpeg UDP portunu açsın
+        with session_lock:
+            for pkt in backlog:
+                out_sock.sendto(pkt, ("127.0.0.1", VIDEO_OUT_PORT))
+            n = len(backlog)
+            backlog.clear()
+            sess["active"] = True
+        last_video[0] = time.time()
+        log(f"ffmpeg başladı, {n} video paketi aktarıldı")
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
             if ready:
@@ -249,15 +268,21 @@ def session():
                     break
                 if not started:
                     started = True
-                    last_video[0] = last_video[0] or time.time()
                     on_start()
                 broadcast(data)
             elif p.poll() is not None:
                 break
-            if started and time.time() - last_video[0] > IDLE_TIMEOUT:
+            if teardown_evt.is_set():
+                log("iPhone yansıtmayı kapattı")
+                break
+            if time.time() - last_video[0] > IDLE_TIMEOUT:
                 log(f"{IDLE_TIMEOUT:.0f} sn görüntü gelmedi, oturum kapatılıyor")
                 break
     finally:
+        with session_lock:
+            sess["active"] = False
+            backlog.clear()
+            first_video.clear()
         stop.set()
         p.kill()
         p.wait()
@@ -268,8 +293,9 @@ def session():
 
 def ffmpeg_loop():
     while True:
+        first_video.wait()  # ffmpeg'i yalnızca video geldiğinde başlat
         session()
-        time.sleep(1)
+        time.sleep(0.5)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -341,6 +367,14 @@ def friendly_name(entity_id):
     return (st or {}).get("attributes", {}).get("friendly_name") or entity_id
 
 
+def pump_uxplay(proc):
+    """UxPlay çıktısını log'a aktarır; yansıtma kapanınca oturumu bitirir."""
+    for line in proc.stdout:
+        print(line, end="", file=sys.stderr, flush=True)
+        if "video_renderer_stop" in line:
+            teardown_evt.set()
+
+
 def uxplay_manager():
     """Ayarlardaki ada göre UxPlay'i başlatır; ayar değişince yeniden başlatır."""
     while True:
@@ -357,7 +391,9 @@ def uxplay_manager():
             args.append("-d")
         log("UxPlay başlatılıyor, AirPlay adı:", name)
         try:
-            proc = subprocess.Popen(args)
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors="replace", bufsize=1)
+            threading.Thread(target=pump_uxplay, args=(proc,), daemon=True).start()
         except OSError as e:
             log("UxPlay başlatılamadı:", e)
             restart_evt.wait(10)
