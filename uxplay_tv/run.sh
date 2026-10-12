@@ -4,6 +4,8 @@
 set -e
 
 export DEBUG="$(jq -r '.debug // false' /data/options.json)"
+export TARGET_MBPS="$(jq -r '.target_mbps // 20' /data/options.json)"
+export JOIN_BURST_MB="$(jq -r '.join_burst_mb // 16' /data/options.json)"
 
 
 # mDNS: UxPlay, Avahi'ye D-Bus üzerinden bağlanır (avahi-client).

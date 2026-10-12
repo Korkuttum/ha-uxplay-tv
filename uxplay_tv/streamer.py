@@ -90,7 +90,8 @@ recent = collections.deque()
 recent_bytes = [0]
 RECENT_MAX = 30_000_000
 NULL_PKT = bytes([0x47, 0x1F, 0xFF, 0x10]) + b"\xff" * 184
-TARGET_BPS = int(os.environ.get("TARGET_BPS") or 5_000_000)  # sabit hız için dolgu
+TARGET_BPS = int(float(os.environ.get("TARGET_MBPS") or 20) * 1_000_000)  # sabit hız için dolgu
+JOIN_BURST = int(float(os.environ.get("JOIN_BURST_MB") or 16) * 1_000_000)  # bağlanan TV'ye ilk yığın
 
 
 def broadcast(data):
@@ -477,6 +478,7 @@ class Session:
                     m.video(au, base + i * 270, key=(i == 0))
             with clients_lock:
                 clients.add(q)
+            snap.append(NULL_PKT * (JOIN_BURST // 188))  # TV tamponu hızla dolsun
             return b"".join(snap)
 
 
@@ -584,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self._stream_headers()
-        q = queue.Queue(maxsize=256)
+        q = queue.Queue(maxsize=8000)
         sess_now = cur["sess"]
         if sess_now is not None:
             snap = sess_now.join(q)
