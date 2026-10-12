@@ -1,5 +1,5 @@
 name: UxPlay AirPlay -> DLNA TV
-version: "0.3.0"
+version: "0.4.0"
 slug: uxplay_tv
 description: iPhone ekran yansıtmayı (AirPlay) alır, DLNA destekli eski TV'lere canlı MPEG-TS akışı olarak gönderir.
 url: https://github.com/Korkuttum/ha-uxplay-tv
@@ -11,7 +11,7 @@ boot: auto
 init: false
 host_network: true
 host_dbus: true
-homeassistant_api: true
+homeassistant_api: false
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:cast-connected

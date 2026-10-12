@@ -6,9 +6,11 @@ yayın bitince (idle_timeout kadar veri gelmezse) TV'yi durdurur.
 """
 import array
 import collections
+import html as htmllib
 import json
 import os
 import queue
+import re
 import select
 import socket
 import subprocess
@@ -16,13 +18,14 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from xml.sax.saxutils import escape as xml_escape
 from tsmux import H264Depacketizer, TsMuxer
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-HA_API = os.environ.get("HA_API", "http://supervisor/core/api/")
 STREAM_PORT = 8090
 UI_PORT = int(os.environ.get("UI_PORT") or 8099)
 AUDIO_BITRATE = "128k"
@@ -34,7 +37,7 @@ VIDEO_IN_PORT = 5010   # UxPlay -> Python
 AUDIO_IN_PORT = 5020   # UxPlay -> Python (RTP L16)
 RESOLUTION = "1920x1080"
 FPS = "30"
-DEFAULTS = {"tv_entity": "", "airplay_name": "", "media_content_type": "video/mpeg"}
+DEFAULTS = {"tv_location": "", "tv_name": "", "airplay_name": "", "media_content_type": "video/mpeg"}
 
 events = collections.deque(maxlen=40)
 
@@ -109,52 +112,127 @@ def close_clients():
                     pass
 
 
-def ha_call(method, path, payload=None):
-    token = os.environ.get("SUPERVISOR_TOKEN")
-    if not token:
-        log("SUPERVISOR_TOKEN yok, HA çağrısı atlandı")
-        return None
+SOAP_ENV = ('<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>{body}</s:Body></s:Envelope>')
+AVT = "urn:schemas-upnp-org:service:AVTransport:1"
+
+
+def parse_description(location):
+    """UPnP cihaz tanımından ad ve AVTransport kontrol adresini okur."""
+    with urllib.request.urlopen(location, timeout=5) as r:
+        xml = r.read().decode(errors="replace")
+    name = re.search(r"<friendlyName>(.*?)</friendlyName>", xml, re.S)
+    control = None
+    for m in re.finditer(r"<service>(.*?)</service>", xml, re.S):
+        if "AVTransport" in m.group(1):
+            c = re.search(r"<controlURL>(.*?)</controlURL>", m.group(1), re.S)
+            if c:
+                control = urllib.parse.urljoin(location, c.group(1).strip())
+    return {
+        "location": location,
+        "ip": urllib.parse.urlparse(location).hostname,
+        "name": htmllib.unescape(name.group(1).strip()) if name else location,
+        "control": control,
+    }
+
+
+def soap(control, action, args):
+    body = f'<u:{action} xmlns:u="{AVT}">' + "".join(f"<{k}>{v}</{k}>" for k, v in args) + f"</u:{action}>"
     req = urllib.request.Request(
-        HA_API + path,
-        data=json.dumps(payload).encode() if payload is not None else None,
-        method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
+        control, data=SOAP_ENV.format(body=body).encode(), method="POST",
+        headers={"Content-Type": 'text/xml; charset="utf-8"', "SOAPACTION": f'"{AVT}#{action}"'})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            body = r.read()
-            if method == "POST":
-                log(f"HA çağrısı tamam: {path} (HTTP {r.status})")
-            return json.loads(body) if body else None
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
-        log(f"HA çağrısı başarısız: {path} -> HTTP {e.code} {e.read()[:200].decode(errors='replace')}")
-        return None
-    except Exception as e:  # noqa: BLE001
-        log("HA çağrısı başarısız:", path, e)
-        return None
+        detail = e.read().decode(errors="replace")
+        code = re.search(r"<errorCode>(\d+)</errorCode>", detail)
+        raise RuntimeError(f"{action} reddedildi (HTTP {e.code}, UPnP hata {code.group(1) if code else '?'})") from None
+
+
+def ssdp_discover(ip=None, wait=3.0):
+    """Ağdaki DLNA medya oynatıcıları (MediaRenderer) bulur."""
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
+           "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n").encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.5)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(STREAM_HOST))
+    except OSError:
+        pass
+    target = (ip, 1900) if ip else ("239.255.255.250", 1900)
+    for _ in range(2):
+        try:
+            sock.sendto(msg, target)
+        except OSError:
+            pass
+    locations = []
+    end = time.time() + wait
+    while time.time() < end:
+        try:
+            data, _ = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        m = re.search(r"(?im)^location:\s*(\S+)", data.decode(errors="replace"))
+        if m and m.group(1) not in locations:
+            locations.append(m.group(1))
+    sock.close()
+    found = []
+    for loc in locations:
+        try:
+            found.append(parse_description(loc))
+        except Exception as e:  # noqa: BLE001
+            log("cihaz tanımı okunamadı:", loc, e)
+    return found
+
+
+def dlna_play(cfg):
+    dev = parse_description(cfg["tv_location"])
+    if not dev["control"]:
+        raise RuntimeError("TV'de AVTransport servisi yok")
+    mime = cfg["media_content_type"]
+    meta = ('<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            '<item id="1" parentID="0" restricted="1"><dc:title>iPhone Ekran</dc:title>'
+            '<upnp:class>object.item.videoItem</upnp:class>'
+            f'<res protocolInfo="http-get:*:{mime}:*">{xml_escape(STREAM_URL)}</res></item></DIDL-Lite>')
+    soap(dev["control"], "SetAVTransportURI", [
+        ("InstanceID", "0"), ("CurrentURI", xml_escape(STREAM_URL)), ("CurrentURIMetaData", xml_escape(meta))])
+    soap(dev["control"], "Play", [("InstanceID", "0"), ("Speed", "1")])
+
+
+def dlna_stop(cfg):
+    dev = parse_description(cfg["tv_location"])
+    if not dev["control"]:
+        return
+    info = soap(dev["control"], "GetMediaInfo", [("InstanceID", "0")])
+    m = re.search(r"<CurrentURI>(.*?)</CurrentURI>", info, re.S)
+    if m and htmllib.unescape(m.group(1)).strip() == STREAM_URL:  # başka içeriği kesme
+        soap(dev["control"], "Stop", [("InstanceID", "0")])
 
 
 def on_start():
     cfg = get_settings()
     log("Yayın başladı ->", STREAM_URL)
     state["live"] = True
-    if cfg["tv_entity"]:
-        ha_call("POST", "services/media_player/play_media", {
-            "entity_id": cfg["tv_entity"],
-            "media_content_id": STREAM_URL,
-            "media_content_type": cfg["media_content_type"],
-        })
+    if cfg["tv_location"]:
+        try:
+            dlna_play(cfg)
+            log("TV'ye gönderildi (DLNA SetAVTransportURI + Play)")
+        except Exception as e:  # noqa: BLE001
+            log("TV'ye gönderilemedi:", e)
 
 
 def on_end():
     cfg = get_settings()
     log("Yayın bitti")
     state["live"] = False
-    if cfg["tv_entity"]:
-        st = ha_call("GET", f"states/{cfg['tv_entity']}")
-        attrs = (st or {}).get("attributes", {})
-        if attrs.get("media_content_id") in (STREAM_URL, None):
-            ha_call("POST", "services/media_player/media_stop", {"entity_id": cfg["tv_entity"]})
+    if cfg["tv_location"]:
+        try:
+            dlna_stop(cfg)
+        except Exception as e:  # noqa: BLE001
+            log("TV durdurulamadı:", e)
 
 
 audio_lock = threading.Lock()
@@ -452,28 +530,6 @@ class Handler(BaseHTTPRequestHandler):
             log("İstemci ayrıldı:", self.address_string())
 
 
-def media_players():
-    states = ha_call("GET", "states")
-    if states is None:
-        return None
-    out = []
-    for s in states:
-        eid = s.get("entity_id", "")
-        if eid.startswith("media_player."):
-            out.append({
-                "entity_id": eid,
-                "name": s.get("attributes", {}).get("friendly_name") or eid,
-                "state": s.get("state"),
-            })
-    out.sort(key=lambda x: x["name"].lower())
-    return out
-
-
-def friendly_name(entity_id):
-    st = ha_call("GET", f"states/{entity_id}")
-    return (st or {}).get("attributes", {}).get("friendly_name") or entity_id
-
-
 def pump_uxplay(proc):
     """UxPlay çıktısını log'a aktarır; yansıtma kapanınca oturumu bitirir."""
     for line in proc.stdout:
@@ -486,11 +542,11 @@ def uxplay_manager():
     """Ayarlardaki ada göre UxPlay'i başlatır; ayar değişince yeniden başlatır."""
     while True:
         cfg = get_settings()
-        if not cfg["tv_entity"]:
+        if not cfg["tv_location"]:
             restart_evt.wait()
             restart_evt.clear()
             continue
-        name = cfg["airplay_name"] or friendly_name(cfg["tv_entity"])
+        name = cfg["airplay_name"] or cfg["tv_name"] or "TV"
         args = [UXPLAY, "-n", name, "-nh", "-p", "-s", RESOLUTION, "-fps", FPS, "-nohold",
                 "-vrtp", f"pt=96 config-interval=1 ! udpsink host=127.0.0.1 port={VIDEO_IN_PORT}",
                 "-artp", f"pt=97 ! udpsink host=127.0.0.1 port={AUDIO_IN_PORT}"]
@@ -550,9 +606,9 @@ class UIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path.endswith("/api/entities"):
-            players = media_players()
-            self._json({"ok": players is not None, "entities": players or []})
+        elif path.endswith("/api/renderers"):
+            self._json({"renderers": [{"location": d["location"], "ip": d["ip"], "name": d["name"]}
+                                      for d in ssdp_discover() if d["control"]]})
         elif path.endswith("/api/logs"):
             self._json({"events": list(events)})
         elif path.endswith("/api/state"):
@@ -571,16 +627,30 @@ class UIHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._json({"error": "geçersiz istek"}, 400)
             return
-        entity = str(data.get("tv_entity", "")).strip()
-        if not entity.startswith("media_player."):
-            self._json({"error": "Lütfen bir medya oynatıcı seçin"}, 400)
+        location = str(data.get("tv_location", "")).strip()
+        ip = str(data.get("tv_ip", "")).strip()
+        try:
+            if ip:  # elle girilen IP: oradan tek tek sor
+                found = [d for d in ssdp_discover(ip=ip) if d["control"]]
+                if not found:
+                    self._json({"error": f"{ip} adresinde DLNA TV bulunamadı (TV açık mı?)"}, 400)
+                    return
+                dev = found[0]
+            elif location.startswith("http"):
+                dev = parse_description(location)
+            else:
+                self._json({"error": "Lütfen bir TV seçin"}, 400)
+                return
+        except Exception as e:  # noqa: BLE001
+            self._json({"error": f"TV'ye ulaşılamadı: {e}"}, 400)
             return
-        name = str(data.get("airplay_name", "")).strip()[:60] or friendly_name(entity)
-        cur = get_settings()
+        name = str(data.get("airplay_name", "")).strip()[:60] or dev["name"]
+        cur_cfg = get_settings()
         save_settings({
-            "tv_entity": entity,
+            "tv_location": dev["location"],
+            "tv_name": dev["name"],
             "airplay_name": name,
-            "media_content_type": str(data.get("media_content_type") or cur["media_content_type"]).strip(),
+            "media_content_type": str(data.get("media_content_type") or cur_cfg["media_content_type"]).strip(),
         })
         restart_evt.set()
         self._json({"ok": True, "airplay_name": name})
@@ -600,6 +670,7 @@ h1{font-size:1.3rem;margin:0 0 4px}p{margin:0 0 12px;color:var(--mut)}
 label{display:block;font-weight:600;margin:16px 0 6px}
 select,input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit}
 button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--acc);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button.sec{background:transparent;color:var(--acc);border:1px solid var(--line);margin-top:8px}
 button:disabled{opacity:.5}
 .row{display:flex;align-items:center;gap:8px;margin:6px 0}.dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}
 .dot.on{background:var(--ok)}.msg{margin-top:12px;min-height:1.4em}.msg.err{color:var(--bad)}.msg.ok{color:var(--ok)}
@@ -607,15 +678,18 @@ details{margin-top:16px}summary{cursor:pointer;color:var(--mut)}code{word-break:
 </style></head><body><main>
 <div class="card">
 <h1>iPhone → TV ekran yansıtma</h1>
-<p>TV'nizi seçin. iPhone'da Ekran Yansıtma listesinde bu isimle görünür.</p>
-<label for="ent">TV (medya oynatıcı)</label>
-<select id="ent"><option value="">Yükleniyor…</option></select>
+<p>Ağdaki TV'yi seçin. iPhone'da Ekran Yansıtma listesinde bu isimle görünür.</p>
+<label for="ent">TV</label>
+<select id="ent"><option value="">TV'ler aranıyor…</option></select>
+<button class="sec" id="scan" type="button">Yeniden ara</button>
 <label for="name">AirPlay adı</label>
 <input id="name" maxlength="60" placeholder="TV adı">
 <details><summary>Gelişmiş</summary>
+<label for="ip">TV bulunmuyorsa IP adresi</label>
+<input id="ip" placeholder="192.168.1.70" inputmode="decimal">
 <label for="mime">Akış MIME türü</label>
 <input id="mime" placeholder="video/mpeg">
-<p style="margin-top:6px">TV akışı açmazsa <code>video/mp2t</code> deneyin.</p></details>
+<p style="margin-top:6px">TV akışı açmazsa <code>video/mp2t</code> veya <code>video/vnd.dlna.mpeg-tts</code> deneyin.</p></details>
 <button id="save">Kaydet</button>
 <div id="msg" class="msg"></div>
 </div>
@@ -630,36 +704,44 @@ details{margin-top:16px}summary{cursor:pointer;color:var(--mut)}code{word-break:
 </div>
 </main>
 <script>
-const $=id=>document.getElementById(id);let dirty=false,names={};
+const $=id=>document.getElementById(id);let dirty=false,names={},saved={};
 const BASE=location.pathname.endsWith("/")?location.pathname:location.pathname+"/";
 const api=p=>fetch(BASE+"api/"+p);
 $("name").addEventListener("input",()=>dirty=true);
 $("ent").addEventListener("change",()=>{if(!dirty||!$("name").value)$("name").value=names[$("ent").value]||"";dirty=false});
+async function scan(){
+  const sel=$("ent");sel.innerHTML='<option value="">TV\'ler aranıyor…</option>';$("scan").disabled=true;
+  try{
+    const r=await api("renderers").then(r=>r.json());
+    sel.innerHTML="";sel.add(new Option(r.renderers.length?"— TV seçin —":"TV bulunamadı (açık mı? Gelişmiş'ten IP girin)",""));
+    r.renderers.forEach(x=>{names[x.location]=x.name;sel.add(new Option(x.name+"  ("+x.ip+")",x.location))});
+    if(saved.tv_location){
+      if(![...sel.options].some(o=>o.value===saved.tv_location)){names[saved.tv_location]=saved.tv_name;sel.add(new Option((saved.tv_name||"TV")+" (kayıtlı)",saved.tv_location))}
+      sel.value=saved.tv_location;
+    }
+  }catch(e){sel.innerHTML='<option value="">Arama başarısız: '+e.message+"</option>"}
+  $("scan").disabled=false;
+}
 async function load(){
-  const [e,s]=await Promise.all([api("entities").then(r=>r.json()),api("state").then(r=>r.json())]);
-  const sel=$("ent");sel.innerHTML="";
-  if(!e.ok){sel.innerHTML='<option value="">Home Assistant\'a ulaşılamadı</option>';}
-  else{
-    sel.add(new Option("— TV seçin —",""));
-    e.entities.forEach(x=>{names[x.entity_id]=x.name;sel.add(new Option(x.name+"  ("+x.entity_id+")",x.entity_id))});
-  }
-  sel.value=s.tv_entity||"";
-  $("name").value=s.airplay_name||names[s.tv_entity]||"";
+  const s=await api("state").then(r=>r.json());saved=s;
+  $("name").value=s.airplay_name||s.tv_name||"";
   $("mime").value=s.media_content_type||"";
   $("url").textContent=s.stream_url;
   refresh(s);
+  await scan();
 }
 function refresh(s){
   $("d1").className="dot"+(s.uxplay?" on":"");
-  $("t1").textContent=s.uxplay?("AirPlay alıcısı çalışıyor: "+(s.airplay_name||"")):"AirPlay alıcısı kapalı (TV seçip kaydedin)";
+  $("t1").textContent=s.uxplay?("AirPlay alıcısı çalışıyor: "+(s.airplay_name||s.tv_name||"")):"AirPlay alıcısı kapalı (TV seçip kaydedin)";
   $("d2").className="dot"+(s.live?" on":"");
   $("t2").textContent=s.live?"Yayın sürüyor":"Yayın yok";
 }
+$("scan").onclick=scan;
 $("save").onclick=async()=>{
   const b=$("save"),m=$("msg");b.disabled=true;m.className="msg";m.textContent="";
   try{
     const r=await fetch(BASE+"api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({tv_entity:$("ent").value,airplay_name:$("name").value,media_content_type:$("mime").value})});
+      body:JSON.stringify({tv_location:$("ent").value,tv_ip:$("ip").value,airplay_name:$("name").value,media_content_type:$("mime").value})});
     const j=await r.json();
     if(!r.ok)throw new Error(j.error||"Kaydedilemedi");
     $("name").value=j.airplay_name;m.className="msg ok";m.textContent="Kaydedildi. iPhone'da “"+j.airplay_name+"” görünecek.";
@@ -669,7 +751,7 @@ $("save").onclick=async()=>{
 };
 async function poll(){try{refresh(await api("state").then(r=>r.json()));
   const l=await api("logs").then(r=>r.json());$("ev").textContent=l.events.length?l.events.slice(-15).join("\n"):"—"}catch(e){}}
-load().then(poll).catch(e=>{$("ent").innerHTML='<option value="">Liste yüklenemedi: '+e.message+"</option>"});setInterval(poll,5000);
+load().then(poll);setInterval(poll,5000);
 </script></body></html>"""
 
 
