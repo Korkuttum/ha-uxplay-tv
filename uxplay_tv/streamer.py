@@ -400,7 +400,7 @@ class Session:
         self.stuff_t0 = None
         self.gop = collections.deque()
         self.gop_bytes = 0
-        self.v0 = None
+        self.last_vpts = 0
         self.a_off = None
         self.a_n = 0
         self.started = False
@@ -432,12 +432,12 @@ class Session:
             if not self.started and not key:
                 return False
             now = self.now90()
-            if self.v0 is None:
-                self.v0 = (rtp_ts, now)
-            pts = DELAY90 + self.v0[1] + ((rtp_ts - self.v0[0]) & 0xFFFFFFFF)
-            if abs(pts - (DELAY90 + now)) > 180000:  # saat kayması: yeniden hizala
-                self.v0 = (rtp_ts, now)
-                pts = DELAY90 + now
+            # UxPlay'in RTP zaman damgaları kare kare ilerlemiyor (uzun süre aynı kalıyor);
+            # bu yüzden kare zamanını geliş saatinden al, hep artan olsun.
+            pts = DELAY90 + now
+            if pts <= self.last_vpts:
+                pts = self.last_vpts + 900  # aynı anda gelen kareleri 10 ms arayla diz
+            self.last_vpts = pts
             if key:
                 self.gop.clear()
                 self.gop_bytes = 0
