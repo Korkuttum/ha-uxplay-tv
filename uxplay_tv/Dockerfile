@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update && apt-get install -y --no-install-recommends dbus \
     && rm -rf /var/lib/apt/lists/*
 
-COPY run.sh streamer.py /opt/uxplay-tv/
+COPY run.sh streamer.py tsmux.py /opt/uxplay-tv/
 RUN chmod +x /opt/uxplay-tv/run.sh
 
 CMD ["/opt/uxplay-tv/run.sh"]

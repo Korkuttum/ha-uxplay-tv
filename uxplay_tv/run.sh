@@ -1,20 +1,10 @@
 #!/bin/bash
-# Avahi (mDNS) + SDP dosyasını hazırlar, sonra streamer.py'yi başlatır.
+# Avahi (mDNS) hazırlar, sonra streamer.py'yi başlatır.
 # UxPlay'i streamer.py yönetir (TV ve AirPlay adı ingress panelinden seçilir).
 set -e
 
 export DEBUG="$(jq -r '.debug // false' /data/options.json)"
-export SDP_FILE=/tmp/uxplay.sdp
 
-cat > "$SDP_FILE" <<SDP
-v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=UxPlay
-c=IN IP4 127.0.0.1
-t=0 0
-m=video 5000 RTP/AVP 96
-a=rtpmap:96 H264/90000
-SDP
 
 # mDNS: UxPlay, Avahi'ye D-Bus üzerinden bağlanır (avahi-client).
 # 1) HA OS'in kendi Avahi'si (host_dbus), 2) olmazsa konteyner içinde dbus + avahi.

@@ -17,9 +17,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from tsmux import H264Depacketizer, TsMuxer
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-SDP_FILE = os.environ.get("SDP_FILE", "/tmp/uxplay.sdp")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 HA_API = os.environ.get("HA_API", "http://supervisor/core/api/")
@@ -31,7 +31,6 @@ DEBUG = os.environ.get("DEBUG", "false") == "true"
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 UXPLAY = os.environ.get("UXPLAY", "uxplay")
 VIDEO_IN_PORT = 5010   # UxPlay -> Python
-VIDEO_OUT_PORT = 5000  # Python -> ffmpeg (SDP; RTCP için 5001 ffmpeg tarafından ayrılır)
 AUDIO_IN_PORT = 5020   # UxPlay -> Python (RTP L16)
 RESOLUTION = "1920x1080"
 FPS = "30"
@@ -162,32 +161,53 @@ audio_lock = threading.Lock()
 audio_buf = bytearray()
 last_video = [0.0]
 BYTES_PER_SEC = 44100 * 4
-session_lock = threading.Lock()
-sess = {"active": False}
-backlog = collections.deque(maxlen=1500)  # oturum açılırken gelen video RTP paketleri
+DELAY90 = 36000  # 0.4 sn oynatma tamponu (90 kHz)
 first_video = threading.Event()
 teardown_evt = threading.Event()
-out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+au_q = queue.Queue(maxsize=900)
+cur = {"sess": None, "have_key": False}
+
+
+def put_au(item):
+    try:
+        au_q.put_nowait(item)
+    except queue.Full:
+        try:
+            au_q.get_nowait()
+            au_q.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            pass
 
 
 def rtp_relay():
-    """Video RTP'yi ffmpeg'e iletir (son paket zamanını tutar); ses RTP'sini PCM tampona alır."""
+    """UxPlay'den gelen video RTP'yi kare kare birleştirir, ses RTP'sini PCM tampona alır."""
     vs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     vs.bind(("127.0.0.1", VIDEO_IN_PORT))
     au = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     au.bind(("127.0.0.1", AUDIO_IN_PORT))
+    depay = H264Depacketizer()
     while True:
         ready, _, _ = select.select([vs, au], [], [], 1.0)
         for sock in ready:
             data = sock.recv(65535)
             if sock is vs:
                 last_video[0] = time.time()
-                with session_lock:
-                    if sess["active"]:
-                        out_sock.sendto(data, ("127.0.0.1", VIDEO_OUT_PORT))
-                    else:
-                        backlog.append(data)
+                unit = depay.feed(data)
+                if not unit:
+                    continue
+                _, _, key = unit
+                if cur["sess"] is None:
+                    # oturum yokken yalnızca son anahtar kareden itibaren tut
+                    if key:
+                        with au_q.mutex:
+                            au_q.queue.clear()
+                        cur["have_key"] = True
+                        put_au(unit)
                         first_video.set()
+                    elif cur["have_key"]:
+                        put_au(unit)
+                else:
+                    put_au(unit)
             elif len(data) > 12:
                 payload = data[12 + 4 * (data[0] & 0x0F):]
                 pcm = array.array("h")
@@ -224,88 +244,145 @@ def audio_feeder(stdin, stop):
         pass
 
 
-def ffmpeg_cmd():
+def audio_cmd():
+    """PCM -> AAC (ADTS). Video ffmpeg'e hiç girmez."""
     return [
-        FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "fatal",
-        "-protocol_whitelist", "file,udp,rtp",
-        "-fflags", "+nobuffer+genpts", "-flags", "low_delay",
-        "-analyzeduration", "200000", "-probesize", "200000",
-        "-i", SDP_FILE,
+        FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "error",
         "-thread_queue_size", "512", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "copy", "-bsf:v", "dump_extra=freq=keyframe",
-        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "44100",
-        "-af", "aresample=async=1:first_pts=0",
-        "-max_interleave_delta", "300000",
-        "-f", "mpegts", "-mpegts_flags", "+resend_headers",
-        "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1",
-        "pipe:1",
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-flush_packets", "1", "-f", "adts", "pipe:1",
     ]
 
 
-def wait_ffmpeg_bound(timeout=15.0):
-    """ffmpeg video UDP portunu açana kadar bekler (port doluysa ffmpeg hazırdır)."""
-    end = time.time() + timeout
-    while time.time() < end:
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            probe.bind(("127.0.0.1", VIDEO_OUT_PORT))
-        except OSError:
-            return True
-        finally:
-            probe.close()
-        time.sleep(0.1)
-    return False
+def adts_reader(stream, sess):
+    buf = bytearray()
+    fd = stream.fileno()
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return
+        buf += chunk
+        while len(buf) >= 7:
+            if buf[0] != 0xFF or (buf[1] & 0xF0) != 0xF0:
+                del buf[0]
+                continue
+            flen = ((buf[3] & 3) << 11) | (buf[4] << 3) | (buf[5] >> 5)
+            if flen < 7:
+                del buf[0]
+                continue
+            if len(buf) < flen:
+                break
+            sess.audio_frame(bytes(buf[:flen]))
+            del buf[:flen]
+
+
+class Session:
+    """Bir yansıtma oturumu: video + ses -> MPEG-TS -> bağlı istemciler."""
+
+    GOP_MAX_BYTES = 6_000_000
+
+    def __init__(self):
+        self.t0 = time.monotonic()
+        self.lock = threading.Lock()
+        self.mux = TsMuxer(broadcast)
+        self.gop = collections.deque()
+        self.gop_bytes = 0
+        self.v0 = None
+        self.a_off = None
+        self.a_n = 0
+        self.started = False
+
+    def now90(self):
+        return int((time.monotonic() - self.t0) * 90000)
+
+    def video(self, au, rtp_ts, key):
+        """True dönerse bu çağrıyla yayın başladı."""
+        with self.lock:
+            if not self.started and not key:
+                return False
+            now = self.now90()
+            if self.v0 is None:
+                self.v0 = (rtp_ts, now)
+            pts = DELAY90 + self.v0[1] + ((rtp_ts - self.v0[0]) & 0xFFFFFFFF)
+            if abs(pts - (DELAY90 + now)) > 180000:  # saat kayması: yeniden hizala
+                self.v0 = (rtp_ts, now)
+                pts = DELAY90 + now
+            if key:
+                self.gop.clear()
+                self.gop_bytes = 0
+            self.gop.append(au)
+            self.gop_bytes += len(au)
+            if self.gop_bytes > self.GOP_MAX_BYTES:
+                self.gop.clear()
+                self.gop_bytes = 0
+            first = not self.started
+            self.started = True
+            self.mux.video(au, pts, key)
+            return first
+
+    def audio_frame(self, frame):
+        with self.lock:
+            if not self.started:
+                return
+            now = self.now90()
+            if self.a_off is None:
+                self.a_off = now
+            pts = DELAY90 + self.a_off + self.a_n * 1024 * 90000 // 44100
+            if abs(pts - (DELAY90 + now)) > 90000:
+                self.a_off = now - self.a_n * 1024 * 90000 // 44100
+                pts = DELAY90 + now
+            self.a_n += 1
+            self.mux.audio(frame, pts, int((time.monotonic() - self.t0) * 27_000_000))
+
+    def join(self, q):
+        """Yeni istemciyi kaydeder; son anahtar karedan başlayan kısa bir giriş verir."""
+        with self.lock:
+            snap = []
+            if self.gop:
+                m = TsMuxer(snap.append)
+                n = len(self.gop)
+                base = max(DELAY90 + self.now90() - (n + 1) * 270, 0)
+                for i, au in enumerate(self.gop):
+                    m.video(au, base + i * 270, key=(i == 0))
+            with clients_lock:
+                clients.add(q)
+            return b"".join(snap)
 
 
 def session():
-    p = subprocess.Popen(ffmpeg_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    s = Session()
+    p = subprocess.Popen(audio_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
     stop = threading.Event()
     threading.Thread(target=audio_feeder, args=(p.stdin, stop), daemon=True).start()
-    fd = p.stdout.fileno()
+    threading.Thread(target=adts_reader, args=(p.stdout, s), daemon=True).start()
+    cur["sess"] = s
     teardown_evt.clear()
+    last_video[0] = time.time()
     started = False
+    log("oturum açıldı, kareler bekleniyor")
     try:
-        ready = wait_ffmpeg_bound()
-        with session_lock:
-            replay = list(backlog)
-            for pkt in replay:
-                out_sock.sendto(pkt, ("127.0.0.1", VIDEO_OUT_PORT))
-            backlog.clear()
-            sess["active"] = True
-        last_video[0] = time.time()
-        t_start = time.time()
-        resent = False
-        log(f"ffmpeg {'hazır' if ready else 'HAZIR DEĞİL (zaman aşımı)'}, {len(replay)} video paketi aktarıldı")
         while True:
-            ready, _, _ = select.select([fd], [], [], 1.0)
-            if ready:
-                data = os.read(fd, 65536)
-                if not data:
-                    break
-                if not started:
-                    started = True
-                    on_start()
-                broadcast(data)
-            elif p.poll() is not None:
-                break
-            if not started and not resent and time.time() - t_start > 3:
-                # ffmpeg hâlâ çıktı vermedi (ekran sabit olabilir): ilk anahtar kareyi tekrar gönder
-                resent = True
-                for pkt in replay:
-                    out_sock.sendto(pkt, ("127.0.0.1", VIDEO_OUT_PORT))
-                log("ffmpeg çıktı vermedi, ilk paketler yeniden gönderildi")
+            try:
+                au, ts, key = au_q.get(timeout=1)
+            except queue.Empty:
+                au = None
+            if au is not None and s.video(au, ts, key):
+                started = True
+                threading.Thread(target=on_start, daemon=True).start()
             if teardown_evt.is_set():
                 log("iPhone yansıtmayı kapattı")
                 break
             if time.time() - last_video[0] > IDLE_TIMEOUT:
                 log(f"{IDLE_TIMEOUT:.0f} sn görüntü gelmedi, oturum kapatılıyor")
                 break
+            if p.poll() is not None:
+                log("ses kodlayıcı (ffmpeg) beklenmedik şekilde kapandı")
+                break
     finally:
-        with session_lock:
-            sess["active"] = False
-            backlog.clear()
-            first_video.clear()
+        cur["sess"] = None
+        cur["have_key"] = False
+        first_video.clear()
+        with au_q.mutex:
+            au_q.queue.clear()
         stop.set()
         p.kill()
         p.wait()
@@ -316,7 +393,7 @@ def session():
 
 def ffmpeg_loop():
     while True:
-        first_video.wait()  # ffmpeg'i yalnızca video geldiğinde başlat
+        first_video.wait()  # yalnızca bir anahtar kare geldiğinde oturum aç
         session()
         time.sleep(0.5)
 
@@ -348,10 +425,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         q = queue.Queue(maxsize=256)
-        with clients_lock:
-            clients.add(q)
+        sess_now = cur["sess"]
+        if sess_now is not None:
+            snap = sess_now.join(q)
+        else:
+            snap = b""
+            with clients_lock:
+                clients.add(q)
         log("İstemci bağlandı:", self.address_string(), "|", (self.headers.get("User-Agent") or "-")[:60])
         try:
+            if snap:
+                self.wfile.write(snap)
             while True:
                 try:
                     data = q.get(timeout=1)
