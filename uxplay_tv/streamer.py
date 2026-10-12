@@ -136,13 +136,13 @@ def parse_description(location):
     }
 
 
-def soap(control, action, args):
+def soap(control, action, args, timeout=8):
     body = f'<u:{action} xmlns:u="{AVT}">' + "".join(f"<{k}>{v}</{k}>" for k, v in args) + f"</u:{action}>"
     req = urllib.request.Request(
         control, data=SOAP_ENV.format(body=body).encode(), method="POST",
         headers={"Content-Type": 'text/xml; charset="utf-8"', "SOAPACTION": f'"{AVT}#{action}"'})
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")
@@ -197,9 +197,16 @@ def dlna_play(cfg):
             '<item id="1" parentID="0" restricted="1"><dc:title>iPhone Ekran</dc:title>'
             '<upnp:class>object.item.videoItem</upnp:class>'
             f'<res protocolInfo="http-get:*:{mime}:*">{xml_escape(STREAM_URL)}</res></item></DIDL-Lite>')
-    soap(dev["control"], "SetAVTransportURI", [
-        ("InstanceID", "0"), ("CurrentURI", xml_escape(STREAM_URL)), ("CurrentURIMetaData", xml_escape(meta))])
-    soap(dev["control"], "Play", [("InstanceID", "0"), ("Speed", "1")])
+    try:
+        # TV bu çağrıyı, akışı açana kadar (HEAD + GET) yanıtlamayabilir
+        soap(dev["control"], "SetAVTransportURI", [
+            ("InstanceID", "0"), ("CurrentURI", xml_escape(STREAM_URL)),
+            ("CurrentURIMetaData", xml_escape(meta))], timeout=30)
+    except (TimeoutError, OSError) as e:
+        if isinstance(e, urllib.error.HTTPError):
+            raise
+        log("SetAVTransportURI yanıt vermedi, Play yine de gönderiliyor:", e)
+    soap(dev["control"], "Play", [("InstanceID", "0"), ("Speed", "1")], timeout=15)
 
 
 def dlna_stop(cfg):
