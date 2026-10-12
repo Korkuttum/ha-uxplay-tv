@@ -10,27 +10,18 @@ iPhone ─AirPlay─► UxPlay ─RTP(H.264 + PCM)─► ffmpeg ─MPEG-TS─►
 
 ## Kurulum
 
-1. Ayarlar → Eklentiler → Eklenti Mağazası → ⋮ → Depolar → bu reponun adresini ekleyin
-   (repo özel ise bunun yerine `uxplay_tv` klasörünü HA'daki `/addons/uxplay_tv/` içine kopyalayıp "Yerel eklentiler"den kurun).
-2. **UxPlay AirPlay -> DLNA TV** eklentisini kurun (ilk derleme Pi'de birkaç dakika sürer).
-3. Yapılandırmada en az `tv_entity` (örn. `media_player.lg_tv`) alanını doldurun.
-4. Eklentiyi başlatın. iPhone'da Denetim Merkezi → Ekran Yansıtma → `airplay_name` ile verdiğiniz isme dokunun.
+1. Ayarlar → Eklentiler → Eklenti Mağazası → ⋮ → Depolar → `https://github.com/Korkuttum/ha-uxplay-tv` ekleyin.
+2. **UxPlay AirPlay -> DLNA TV** eklentisini kurun ve başlatın (ilk derleme Pi'de uzun sürebilir).
+3. Kenar çubuğundaki **UxPlay TV** panelini (veya eklentideki "Arayüzü aç" düğmesini) açın.
+4. Listeden TV'nizi (medya oynatıcı) seçin. AirPlay adı olarak TV'nin adı otomatik gelir, isterseniz değiştirin. **Kaydet**.
+5. iPhone'da Denetim Merkezi → Ekran Yansıtma → listedeki adı seçin.
+
+Başka bir ayar gerekmez. Akış adresi otomatik bulunur (`http://<pi-ip>:8090/stream.ts`).
 
 ## Ayarlar
 
-| Ayar | Açıklama |
-|---|---|
-| `airplay_name` | iPhone'da görünecek cihaz adı |
-| `tv_entity` | HA'daki DLNA TV varlığı (boşsa otomatik oynatma kapalı) |
-| `stream_host` | TV'nin ulaşacağı Pi IP'si; boşsa otomatik bulunur |
-| `stream_port` | HTTP akış portu (varsayılan 8090) |
-| `media_content_type` | `play_media` MIME türü. TV reddederse `video/mp2t` veya `video/vnd.dlna.mpeg-tts` deneyin |
-| `resolution`, `fps` | iPhone'a bildirilen yayın boyutu / kare hızı |
-| `audio_bitrate` | AAC ses bit hızı |
-| `idle_timeout` | Bu kadar sn veri gelmezse yayın bitmiş sayılır |
-| `auto_play` | Yayın başlayınca TV'ye otomatik gönder |
-| `stop_tv_on_end` | Yayın bitince TV'yi durdur |
-| `debug` | Ayrıntılı log |
+Tüm ayarlar panelden yapılır. Eklentinin Yapılandırma sekmesinde yalnızca `debug` (ayrıntılı log) vardır.
+Panelde "Gelişmiş" altında **Akış MIME türü** bulunur. TV akışı reddederse `video/mp2t` veya `video/vnd.dlna.mpeg-tts` deneyin.
 
 ## Elle test
 

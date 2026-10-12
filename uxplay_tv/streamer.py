@@ -17,16 +17,19 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SDP_FILE = os.environ.get("SDP_FILE", "/tmp/uxplay.sdp")
-PORT = int(os.environ.get("STREAM_PORT") or 8090)
-CONTENT_TYPE = os.environ.get("MEDIA_CONTENT_TYPE") or "video/mpeg"
-AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE") or "128k"
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+HA_API = os.environ.get("HA_API", "http://supervisor/core/api/")
+STREAM_PORT = 8090
+UI_PORT = int(os.environ.get("UI_PORT") or 8099)
+AUDIO_BITRATE = "128k"
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT") or 20)
-TV_ENTITY = os.environ.get("TV_ENTITY", "")
-AUTO_PLAY = os.environ.get("AUTO_PLAY", "true") == "true"
-STOP_ON_END = os.environ.get("STOP_TV_ON_END", "true") == "true"
 DEBUG = os.environ.get("DEBUG", "false") == "true"
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
-
+UXPLAY = os.environ.get("UXPLAY", "uxplay")
+RESOLUTION = "1920x1080"
+FPS = "30"
+DEFAULTS = {"tv_entity": "", "airplay_name": "", "media_content_type": "video/mpeg"}
 
 def log(*a):
     print("[streamer]", *a, file=sys.stderr, flush=True)
@@ -43,12 +46,31 @@ def local_ip():
         s.close()
 
 
-STREAM_HOST = os.environ.get("STREAM_HOST") or local_ip()
-STREAM_URL = f"http://{STREAM_HOST}:{PORT}/stream.ts"
+STREAM_HOST = local_ip()
+STREAM_URL = f"http://{STREAM_HOST}:{STREAM_PORT}/stream.ts"
 
 clients = set()
 clients_lock = threading.Lock()
-state = {"live": False}
+state = {"live": False, "uxplay": False}
+settings_lock = threading.Lock()
+restart_evt = threading.Event()
+
+
+def get_settings():
+    with settings_lock:
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+    return {**DEFAULTS, **{k: v for k, v in data.items() if k in DEFAULTS}}
+
+
+def save_settings(data):
+    with settings_lock:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f)
 
 
 def broadcast(data):
@@ -83,7 +105,7 @@ def ha_call(method, path, payload=None):
         log("SUPERVISOR_TOKEN yok, HA çağrısı atlandı")
         return None
     req = urllib.request.Request(
-        "http://supervisor/core/api/" + path,
+        HA_API + path,
         data=json.dumps(payload).encode() if payload is not None else None,
         method=method,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -98,24 +120,26 @@ def ha_call(method, path, payload=None):
 
 
 def on_start():
+    cfg = get_settings()
     log("Yayın başladı ->", STREAM_URL)
     state["live"] = True
-    if AUTO_PLAY and TV_ENTITY:
+    if cfg["tv_entity"]:
         ha_call("POST", "services/media_player/play_media", {
-            "entity_id": TV_ENTITY,
+            "entity_id": cfg["tv_entity"],
             "media_content_id": STREAM_URL,
-            "media_content_type": CONTENT_TYPE,
+            "media_content_type": cfg["media_content_type"],
         })
 
 
 def on_end():
+    cfg = get_settings()
     log("Yayın bitti")
     state["live"] = False
-    if STOP_ON_END and TV_ENTITY:
-        st = ha_call("GET", f"states/{TV_ENTITY}")
+    if cfg["tv_entity"]:
+        st = ha_call("GET", f"states/{cfg['tv_entity']}")
         attrs = (st or {}).get("attributes", {})
         if attrs.get("media_content_id") in (STREAM_URL, None):
-            ha_call("POST", "services/media_player/media_stop", {"entity_id": TV_ENTITY})
+            ha_call("POST", "services/media_player/media_stop", {"entity_id": cfg["tv_entity"]})
 
 
 def ffmpeg_cmd():
@@ -192,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_response(200)
-        self.send_header("Content-Type", CONTENT_TYPE)
+        self.send_header("Content-Type", get_settings()["media_content_type"])
         self.send_header("transferMode.dlna.org", "Streaming")
         self.send_header("contentFeatures.dlna.org",
                          "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
@@ -220,10 +244,208 @@ class Handler(BaseHTTPRequestHandler):
             log("İstemci ayrıldı:", self.address_string())
 
 
+def media_players():
+    states = ha_call("GET", "states")
+    if states is None:
+        return None
+    out = []
+    for s in states:
+        eid = s.get("entity_id", "")
+        if eid.startswith("media_player."):
+            out.append({
+                "entity_id": eid,
+                "name": s.get("attributes", {}).get("friendly_name") or eid,
+                "state": s.get("state"),
+            })
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def friendly_name(entity_id):
+    st = ha_call("GET", f"states/{entity_id}")
+    return (st or {}).get("attributes", {}).get("friendly_name") or entity_id
+
+
+def uxplay_manager():
+    """Ayarlardaki ada göre UxPlay'i başlatır; ayar değişince yeniden başlatır."""
+    while True:
+        cfg = get_settings()
+        if not cfg["tv_entity"]:
+            restart_evt.wait()
+            restart_evt.clear()
+            continue
+        name = cfg["airplay_name"] or friendly_name(cfg["tv_entity"])
+        args = [UXPLAY, "-n", name, "-nh", "-p", "-s", RESOLUTION, "-fps", FPS, "-nohold",
+                "-vrtp", "pt=96 config-interval=1 ! udpsink host=127.0.0.1 port=5000",
+                "-artp", "pt=97 ! udpsink host=127.0.0.1 port=5002"]
+        if DEBUG:
+            args.append("-d")
+        log("UxPlay başlatılıyor, AirPlay adı:", name)
+        try:
+            proc = subprocess.Popen(args)
+        except OSError as e:
+            log("UxPlay başlatılamadı:", e)
+            restart_evt.wait(10)
+            restart_evt.clear()
+            continue
+        state["uxplay"] = True
+        while proc.poll() is None and not restart_evt.wait(1):
+            pass
+        restart_evt.clear()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        state["uxplay"] = False
+        time.sleep(1)
+
+
+class UIHandler(BaseHTTPRequestHandler):
+    """Home Assistant Ingress paneli (yalnızca Supervisor üzerinden erişilir)."""
+
+    def log_message(self, fmt, *args):
+        if DEBUG:
+            log("ui", fmt % args)
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        path = self.path.split("?")[0].rstrip("/")
+        if path in ("", "/index.html"):
+            body = UI_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path.endswith("/api/entities"):
+            players = media_players()
+            self._json({"ok": players is not None, "entities": players or []})
+        elif path.endswith("/api/state"):
+            self._json({**get_settings(), "live": state["live"], "uxplay": state["uxplay"],
+                        "stream_url": STREAM_URL})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):  # noqa: N802
+        if not self.path.split("?")[0].endswith("/api/settings"):
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            self._json({"error": "geçersiz istek"}, 400)
+            return
+        entity = str(data.get("tv_entity", "")).strip()
+        if not entity.startswith("media_player."):
+            self._json({"error": "Lütfen bir medya oynatıcı seçin"}, 400)
+            return
+        name = str(data.get("airplay_name", "")).strip()[:60] or friendly_name(entity)
+        cur = get_settings()
+        save_settings({
+            "tv_entity": entity,
+            "airplay_name": name,
+            "media_content_type": str(data.get("media_content_type") or cur["media_content_type"]).strip(),
+        })
+        restart_evt.set()
+        self._json({"ok": True, "airplay_name": name})
+
+
+UI_HTML = r"""<!doctype html>
+<html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UxPlay TV</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1b1d21;--mut:#6b7280;--line:#d9dce1;--acc:#03a9f4;--ok:#1b9e4b;--bad:#d03a3a}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--card:#1c1f26;--fg:#e8eaed;--mut:#9aa0aa;--line:#2f343d}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+main{max-width:520px;margin:0 auto;padding:24px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
+h1{font-size:1.3rem;margin:0 0 4px}p{margin:0 0 12px;color:var(--mut)}
+label{display:block;font-weight:600;margin:16px 0 6px}
+select,input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit}
+button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:10px;background:var(--acc);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5}
+.row{display:flex;align-items:center;gap:8px;margin:6px 0}.dot{width:10px;height:10px;border-radius:50%;background:var(--mut)}
+.dot.on{background:var(--ok)}.msg{margin-top:12px;min-height:1.4em}.msg.err{color:var(--bad)}.msg.ok{color:var(--ok)}
+details{margin-top:16px}summary{cursor:pointer;color:var(--mut)}code{word-break:break-all}
+</style></head><body><main>
+<div class="card">
+<h1>iPhone → TV ekran yansıtma</h1>
+<p>TV'nizi seçin. iPhone'da Ekran Yansıtma listesinde bu isimle görünür.</p>
+<label for="ent">TV (medya oynatıcı)</label>
+<select id="ent"><option value="">Yükleniyor…</option></select>
+<label for="name">AirPlay adı</label>
+<input id="name" maxlength="60" placeholder="TV adı">
+<details><summary>Gelişmiş</summary>
+<label for="mime">Akış MIME türü</label>
+<input id="mime" placeholder="video/mpeg">
+<p style="margin-top:6px">TV akışı açmazsa <code>video/mp2t</code> deneyin.</p></details>
+<button id="save">Kaydet</button>
+<div id="msg" class="msg"></div>
+</div>
+<div class="card">
+<div class="row"><span id="d1" class="dot"></span><span id="t1">AirPlay alıcısı</span></div>
+<div class="row"><span id="d2" class="dot"></span><span id="t2">Yayın yok</span></div>
+<p style="margin-top:10px">Akış adresi: <code id="url"></code></p>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);let dirty=false,names={};
+$("name").addEventListener("input",()=>dirty=true);
+$("ent").addEventListener("change",()=>{if(!dirty||!$("name").value)$("name").value=names[$("ent").value]||"";dirty=false});
+async function load(){
+  const [e,s]=await Promise.all([fetch("api/entities").then(r=>r.json()),fetch("api/state").then(r=>r.json())]);
+  const sel=$("ent");sel.innerHTML="";
+  if(!e.ok){sel.innerHTML='<option value="">Home Assistant\'a ulaşılamadı</option>';}
+  else{
+    sel.add(new Option("— TV seçin —",""));
+    e.entities.forEach(x=>{names[x.entity_id]=x.name;sel.add(new Option(x.name+"  ("+x.entity_id+")",x.entity_id))});
+  }
+  sel.value=s.tv_entity||"";
+  $("name").value=s.airplay_name||names[s.tv_entity]||"";
+  $("mime").value=s.media_content_type||"";
+  $("url").textContent=s.stream_url;
+  refresh(s);
+}
+function refresh(s){
+  $("d1").className="dot"+(s.uxplay?" on":"");
+  $("t1").textContent=s.uxplay?("AirPlay alıcısı çalışıyor: "+(s.airplay_name||"")):"AirPlay alıcısı kapalı (TV seçip kaydedin)";
+  $("d2").className="dot"+(s.live?" on":"");
+  $("t2").textContent=s.live?"Yayın sürüyor":"Yayın yok";
+}
+$("save").onclick=async()=>{
+  const b=$("save"),m=$("msg");b.disabled=true;m.className="msg";m.textContent="";
+  try{
+    const r=await fetch("api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({tv_entity:$("ent").value,airplay_name:$("name").value,media_content_type:$("mime").value})});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||"Kaydedilemedi");
+    $("name").value=j.airplay_name;m.className="msg ok";m.textContent="Kaydedildi. iPhone'da “"+j.airplay_name+"” görünecek.";
+    setTimeout(poll,2500);
+  }catch(x){m.className="msg err";m.textContent=x.message}
+  b.disabled=false;
+};
+async function poll(){try{refresh(await fetch("api/state").then(r=>r.json()))}catch(e){}}
+load();setInterval(poll,5000);
+</script></body></html>"""
+
+
 def main():
-    log("Akış adresi:", STREAM_URL, "| TV:", TV_ENTITY or "(ayarlanmadı)")
+    log("Akış adresi:", STREAM_URL)
     threading.Thread(target=ffmpeg_loop, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    threading.Thread(target=uxplay_manager, daemon=True).start()
+    threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", UI_PORT), UIHandler).serve_forever, daemon=True).start()
+    ThreadingHTTPServer(("0.0.0.0", STREAM_PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
