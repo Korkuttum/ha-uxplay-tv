@@ -86,7 +86,18 @@ def save_settings(data):
             json.dump(data, f)
 
 
+recent = collections.deque()
+recent_bytes = [0]
+RECENT_MAX = 30_000_000
+NULL_PKT = bytes([0x47, 0x1F, 0xFF, 0x10]) + b"\xff" * 184
+TARGET_BPS = int(os.environ.get("TARGET_BPS") or 5_000_000)  # sabit hız için dolgu
+
+
 def broadcast(data):
+    recent.append(data)
+    recent_bytes[0] += len(data)
+    while recent_bytes[0] > RECENT_MAX and recent:
+        recent_bytes[0] -= len(recent.popleft())
     with clients_lock:
         for q in list(clients):
             try:
@@ -384,13 +395,33 @@ class Session:
     def __init__(self):
         self.t0 = time.monotonic()
         self.lock = threading.Lock()
-        self.mux = TsMuxer(broadcast)
+        self.mux = TsMuxer(self._emit)
+        self.sent = 0
+        self.stuff_t0 = None
         self.gop = collections.deque()
         self.gop_bytes = 0
         self.v0 = None
         self.a_off = None
         self.a_n = 0
         self.started = False
+
+    def _emit(self, data):
+        self.sent += len(data)
+        broadcast(data)
+
+    def stuff(self):
+        """Sabit bit hızı için boş (PID 0x1FFF) paket ekler; TV tamponu hızlı dolsun."""
+        with self.lock:
+            if not self.started:
+                return
+            now = time.monotonic()
+            if self.stuff_t0 is None:
+                self.stuff_t0 = now
+                self.sent = 0
+            deficit = int((now - self.stuff_t0) * TARGET_BPS / 8) - self.sent
+            n = min(deficit // 188, 600)
+            if n > 8:
+                self._emit(NULL_PKT * n)
 
     def now90(self):
         return int((time.monotonic() - self.t0) * 90000)
@@ -456,6 +487,15 @@ def session():
     threading.Thread(target=audio_feeder, args=(p.stdin, stop), daemon=True).start()
     threading.Thread(target=adts_reader, args=(p.stdout, s), daemon=True).start()
     cur["sess"] = s
+    recent.clear()
+    recent_bytes[0] = 0
+
+    def stuffer():
+        while not stop.is_set():
+            time.sleep(0.01)
+            s.stuff()
+
+    threading.Thread(target=stuffer, daemon=True).start()
     teardown_evt.clear()
     last_video[0] = time.time()
     started = False
@@ -529,6 +569,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"live": state["live"], "url": STREAM_URL}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/debug/last.ts"):
+            body = b"".join(recent)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
             return
