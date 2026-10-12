@@ -187,8 +187,24 @@ def ssdp_discover(ip=None, wait=3.0):
     return found
 
 
+def resolve_device(cfg):
+    """TV'nin UPnP portu yeniden açılışta değişir: bağlanamazsak IP'den yeniden bul ve kaydet."""
+    try:
+        return parse_description(cfg["tv_location"])
+    except OSError as e:
+        host = urllib.parse.urlparse(cfg["tv_location"]).hostname
+        log(f"TV {cfg['tv_location']} adresinde yanıt vermedi ({e}), yeniden aranıyor")
+        for found in (ssdp_discover(ip=host, wait=2.5), ssdp_discover(wait=3.0)):
+            for d in found:
+                if d["ip"] == host and d["control"]:
+                    save_settings({**get_settings(), "tv_location": d["location"], "tv_name": d["name"]})
+                    log("TV yeni adresiyle bulundu:", d["location"])
+                    return d
+        raise RuntimeError(f"TV ({host}) bulunamadı; açık mı?") from e
+
+
 def dlna_play(cfg):
-    dev = parse_description(cfg["tv_location"])
+    dev = resolve_device(cfg)
     if not dev["control"]:
         raise RuntimeError("TV'de AVTransport servisi yok")
     mime = cfg["media_content_type"]
@@ -210,7 +226,7 @@ def dlna_play(cfg):
 
 
 def dlna_stop(cfg):
-    dev = parse_description(cfg["tv_location"])
+    dev = resolve_device(cfg)
     if not dev["control"]:
         return
     info = soap(dev["control"], "GetMediaInfo", [("InstanceID", "0")])
