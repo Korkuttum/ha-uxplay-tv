@@ -144,7 +144,7 @@ def on_end():
 
 def ffmpeg_cmd():
     return [
-        FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "warning",
+        FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "fatal",
         "-protocol_whitelist", "file,udp,rtp",
         "-fflags", "+nobuffer+genpts", "-flags", "low_delay",
         "-analyzeduration", "1000000", "-probesize", "500000",
@@ -401,10 +401,12 @@ details{margin-top:16px}summary{cursor:pointer;color:var(--mut)}code{word-break:
 </main>
 <script>
 const $=id=>document.getElementById(id);let dirty=false,names={};
+const BASE=location.pathname.endsWith("/")?location.pathname:location.pathname+"/";
+const api=p=>fetch(BASE+"api/"+p);
 $("name").addEventListener("input",()=>dirty=true);
 $("ent").addEventListener("change",()=>{if(!dirty||!$("name").value)$("name").value=names[$("ent").value]||"";dirty=false});
 async function load(){
-  const [e,s]=await Promise.all([fetch("api/entities").then(r=>r.json()),fetch("api/state").then(r=>r.json())]);
+  const [e,s]=await Promise.all([api("entities").then(r=>r.json()),api("state").then(r=>r.json())]);
   const sel=$("ent");sel.innerHTML="";
   if(!e.ok){sel.innerHTML='<option value="">Home Assistant\'a ulaşılamadı</option>';}
   else{
@@ -426,7 +428,7 @@ function refresh(s){
 $("save").onclick=async()=>{
   const b=$("save"),m=$("msg");b.disabled=true;m.className="msg";m.textContent="";
   try{
-    const r=await fetch("api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
+    const r=await fetch(BASE+"api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({tv_entity:$("ent").value,airplay_name:$("name").value,media_content_type:$("mime").value})});
     const j=await r.json();
     if(!r.ok)throw new Error(j.error||"Kaydedilemedi");
@@ -435,8 +437,8 @@ $("save").onclick=async()=>{
   }catch(x){m.className="msg err";m.textContent=x.message}
   b.disabled=false;
 };
-async function poll(){try{refresh(await fetch("api/state").then(r=>r.json()))}catch(e){}}
-load();setInterval(poll,5000);
+async function poll(){try{refresh(await api("state").then(r=>r.json()))}catch(e){}}
+load().catch(e=>{$("ent").innerHTML='<option value="">Liste yüklenemedi: '+e.message+"</option>"});setInterval(poll,5000);
 </script></body></html>"""
 
 
