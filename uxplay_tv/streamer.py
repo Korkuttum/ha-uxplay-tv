@@ -483,6 +483,24 @@ class Handler(BaseHTTPRequestHandler):
         if DEBUG:
             log(self.address_string(), fmt % args)
 
+    def _stream_headers(self):
+        self.send_response(200)
+        self.send_header("Content-Type", get_settings()["media_content_type"])
+        self.send_header("transferMode.dlna.org", "Streaming")
+        self.send_header("contentFeatures.dlna.org",
+                         "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_HEAD(self):  # noqa: N802
+        """DLNA TV'ler oynatmadan önce HEAD ile içerik türünü sorar."""
+        if self.path == "/" or self.path.startswith("/stream.ts"):
+            log("TV içerik bilgisi istedi (HEAD)", self.address_string())
+            self._stream_headers()
+        else:
+            self.send_error(404)
+
     def do_GET(self):  # noqa: N802
         if self.path.startswith("/health"):
             body = json.dumps({"live": state["live"], "url": STREAM_URL}).encode()
@@ -494,14 +512,7 @@ class Handler(BaseHTTPRequestHandler):
         if not (self.path == "/" or self.path.startswith("/stream.ts")):
             self.send_error(404)
             return
-        self.send_response(200)
-        self.send_header("Content-Type", get_settings()["media_content_type"])
-        self.send_header("transferMode.dlna.org", "Streaming")
-        self.send_header("contentFeatures.dlna.org",
-                         "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
+        self._stream_headers()
         q = queue.Queue(maxsize=256)
         sess_now = cur["sess"]
         if sess_now is not None:
