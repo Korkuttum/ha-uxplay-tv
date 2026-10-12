@@ -229,7 +229,7 @@ def ffmpeg_cmd():
         FFMPEG, "-hide_banner", "-loglevel", "info" if DEBUG else "fatal",
         "-protocol_whitelist", "file,udp,rtp",
         "-fflags", "+nobuffer+genpts", "-flags", "low_delay",
-        "-analyzeduration", "1000000", "-probesize", "500000",
+        "-analyzeduration", "200000", "-probesize", "200000",
         "-i", SDP_FILE,
         "-thread_queue_size", "512", "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
         "-map", "0:v:0", "-map", "1:a:0",
@@ -243,6 +243,21 @@ def ffmpeg_cmd():
     ]
 
 
+def wait_ffmpeg_bound(timeout=15.0):
+    """ffmpeg video UDP portunu açana kadar bekler (port doluysa ffmpeg hazırdır)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind(("127.0.0.1", VIDEO_OUT_PORT))
+        except OSError:
+            return True
+        finally:
+            probe.close()
+        time.sleep(0.1)
+    return False
+
+
 def session():
     p = subprocess.Popen(ffmpeg_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
     stop = threading.Event()
@@ -251,15 +266,17 @@ def session():
     teardown_evt.clear()
     started = False
     try:
-        time.sleep(1.2)  # ffmpeg UDP portunu açsın
+        ready = wait_ffmpeg_bound()
         with session_lock:
-            for pkt in backlog:
+            replay = list(backlog)
+            for pkt in replay:
                 out_sock.sendto(pkt, ("127.0.0.1", VIDEO_OUT_PORT))
-            n = len(backlog)
             backlog.clear()
             sess["active"] = True
         last_video[0] = time.time()
-        log(f"ffmpeg başladı, {n} video paketi aktarıldı")
+        t_start = time.time()
+        resent = False
+        log(f"ffmpeg {'hazır' if ready else 'HAZIR DEĞİL (zaman aşımı)'}, {len(replay)} video paketi aktarıldı")
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
             if ready:
@@ -272,6 +289,12 @@ def session():
                 broadcast(data)
             elif p.poll() is not None:
                 break
+            if not started and not resent and time.time() - t_start > 3:
+                # ffmpeg hâlâ çıktı vermedi (ekran sabit olabilir): ilk anahtar kareyi tekrar gönder
+                resent = True
+                for pkt in replay:
+                    out_sock.sendto(pkt, ("127.0.0.1", VIDEO_OUT_PORT))
+                log("ffmpeg çıktı vermedi, ilk paketler yeniden gönderildi")
             if teardown_evt.is_set():
                 log("iPhone yansıtmayı kapattı")
                 break
